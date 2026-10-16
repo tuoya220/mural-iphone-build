@@ -1,0 +1,163 @@
+name: Build Mural for personal iPhone
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_identifier:
+        description: Keep this identifier stable for future updates
+        required: true
+        default: com.gindeng.mural
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mural-personal-iphone
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      MURAL_SOURCE_REVISION: bb45a7b0af230f966970b587047611cac9e0f9cc
+      PERSONAL_BUNDLE_ID: ${{ inputs.bundle_identifier }}
+    steps:
+      - name: Download pinned Mural source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Chuloo/mural
+          ref: ${{ env.MURAL_SOURCE_REVISION }}
+          path: mural
+          persist-credentials: false
+
+      - name: Check environment
+        working-directory: mural
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PERSONAL_BUNDLE_ID" =~ ^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z0-9-]+)+$ ]]
+          mkdir -p ../release
+          git rev-parse HEAD | tee ../release/source-revision.txt
+          xcodebuild -version | tee ../release/xcode-version.txt
+          xcodebuild -showsdks
+          swift --version
+          python3 - <<'PY'
+          import re
+          import subprocess
+          version = subprocess.check_output(['xcodebuild', '-version'], text=True)
+          assert int(re.search(r'Xcode (\d+)', version).group(1)) >= 26, version
+          PY
+
+      - name: Run offline Swift core tests
+        working-directory: mural
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path apps/ios 2>&1 | tee ../release/core-tests.log
+
+      - name: Resolve pinned WebRTC dependency
+        working-directory: mural
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project apps/ios/Mural.xcodeproj -scheme Mural \
+            -clonedSourcePackagesDirPath .build/SourcePackages \
+            -onlyUsePackageVersionsFromResolvedFile \
+            2>&1 | tee ../release/dependencies.log
+          git diff --exit-code -- apps/ios/Mural.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Build Simulator and unsigned iPhone app
+        working-directory: mural
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(
+            -project apps/ios/Mural.xcodeproj -scheme Mural
+            -configuration Release
+            -clonedSourcePackagesDirPath .build/SourcePackages
+            -disableAutomaticPackageResolution
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= CODE_SIGN_ENTITLEMENTS=
+            "PRODUCT_BUNDLE_IDENTIFIER=$PERSONAL_BUNDLE_ID"
+            MURAL_MANAGED_ACCOUNTS_ENABLED=NO
+            MURAL_MANAGED_API_URL=
+            MURAL_GOOGLE_SIGN_IN_ENABLED=NO
+            MURAL_GOOGLE_CLIENT_ID=
+            MURAL_GOOGLE_CALLBACK_SCHEME=com.gindeng.mural.disabled-google
+            MURAL_APPLE_SIGN_IN_ENABLED=NO
+            MURAL_APPLE_SWIFT_FLAGS= MURAL_APPLE_ENTITLEMENTS=
+            MURAL_APPLE_PURCHASES_ENABLED=NO
+          )
+          xcodebuild "${common[@]}" \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/Simulator \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build \
+            2>&1 | tee ../release/simulator-build.log
+          xcodebuild "${common[@]}" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .build/iPhone \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build \
+            2>&1 | tee ../release/iphone-build.log
+
+      - name: Verify personal configuration and package IPA
+        working-directory: mural
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+          app = Path('.build/iPhone/Build/Products/Release-iphoneos/Mural.app')
+          with (app / 'Info.plist').open('rb') as stream:
+              info = plistlib.load(stream)
+          assert info['CFBundleIdentifier'] == os.environ['PERSONAL_BUNDLE_ID']
+          assert (app / info['CFBundleExecutable']).is_file()
+          for key in ('MuralManagedAccountsEnabled', 'MuralGoogleSignInEnabled',
+                      'MuralAppleSignInEnabled', 'MuralApplePurchasesEnabled'):
+              assert str(info[key]).upper() == 'NO', (key, info[key])
+          assert info.get('MuralManagedAPIURL', '') == ''
+          assert 'audio' in info['UIBackgroundModes']
+          assert info['NSMicrophoneUsageDescription']
+          print('Verified personal build configuration and executable.')
+          print('Minimum iOS:', info['MinimumOSVersion'])
+          PY
+          mkdir -p ../release/Payload
+          ditto .build/iPhone/Build/Products/Release-iphoneos/Mural.app ../release/Payload/Mural.app
+          cd ../release
+          ditto -c -k --keepParent Payload Mural-unsigned.ipa
+          unzip -t Mural-unsigned.ipa > ipa-integrity.txt
+          shasum -a 256 Mural-unsigned.ipa > SHA256SUMS.txt
+          printf '%s\n' \
+            'Unsigned personal build. Sign and install with Sideloadly on Windows.' \
+            'No Apple credentials or API keys are required by this workflow.' \
+            'Core tests and simulator/device compilation do not verify a real iPhone.' \
+            'Use the same Apple Account and bundle identifier for updates.' \
+            > INSTALL.txt
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mural-personal-iPhone-unsigned
+          path: |
+            release/Mural-unsigned.ipa
+            release/SHA256SUMS.txt
+            release/INSTALL.txt
+            release/source-revision.txt
+            release/xcode-version.txt
+            release/ipa-integrity.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mural-build-diagnostics
+          path: release/*.log
+          if-no-files-found: ignore
+          retention-days: 7
